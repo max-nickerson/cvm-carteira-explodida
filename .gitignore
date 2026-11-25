@@ -1,0 +1,5 @@
+dados/
+saida/
+__pycache__/
+*.csv
+*.xlsx

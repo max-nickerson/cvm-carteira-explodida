@@ -6,8 +6,15 @@ Cotas de fundos que mandam CDA são abertas (FIC dentro de FIC, quantos níveis 
 (FIDC, FII, FIAGRO, exterior) ficam como um ativo.
 
 Uso:  python carteira_explodida.py            (meses = 12, limite de oculto = 5%)
-Saída: saida/AAAAMM.parquet  -> fundo, ativo, valor (R$ da posição que é do fundo, depois de abrir as cotas)
-       saida/ativos.parquet  -> ativo, bloco, tipo, codigo, descricao, emissor, cnpj_emissor, vencimento
+Saída: saida/AAAAMM.parquet        -> fundo, ativo, valor (R$ da posição que é do fundo, depois de abrir as cotas)
+       saida/fundos_AAAAMM.parquet -> fundo, pl, de_outros_fundos, externo, em_cotas_que_abrem, papel
+       saida/total_AAAAMM.parquet  -> ativo, valor_total (total dos fundos SEM dupla contagem)
+       saida/ativos.parquet        -> ativo, bloco, tipo, codigo, descricao, emissor, cnpj_emissor, vencimento
+
+Dupla contagem: a carteira explodida de CADA fundo está certa, mas somar todos os fundos conta o master e de novo cada FIC
+que o compra. Para totais, pese cada fundo pela parte do PL que é de investidores de fora (externo = 1 - de_outros_fundos):
+  total(ativo) = soma(valor x externo) = total_AAAAMM.parquet.  Para olhar só o que chega ao investidor final, use os
+fundos com externo > 0 (FICs e fundos diretos), não os 'só de fundos (master/alimentado)'.
 """
 import io, re, sys, zipfile
 from pathlib import Path
@@ -70,7 +77,7 @@ def ativo_id(p):
 def explode(pl, pos):
     """E = D + W·D + W²·D + ...  (W[i,j] = parte do fundo j que é do fundo i; D = posições diretas que não abrem)."""
     filho = pos.get("CNPJ_FUNDO_CLASSE_COTA", pd.Series(np.nan, index=pos.index))
-    abre = filho.isin(pl.index) & (filho != pos.CNPJ_FUNDO_CLASSE)
+    abre = filho.isin(pl.index[pl > 0]) & (filho != pos.CNPJ_FUNDO_CLASSE)          # PL zero/negativo: não abre (fica como ativo)
     fundos = pd.Index(sorted(set(pl.index) | set(pos.CNPJ_FUNDO_CLASSE)))
     c = pos[abre]
     W = sparse.csr_matrix(((c.valor / c[filho.name].map(pl)).values,
@@ -90,7 +97,16 @@ def explode(pl, pos):
     E = E.tocoo()
     out = pd.DataFrame({"fundo": fundos[E.row], "ativo": ativos[E.col], "valor": E.data})
     info = info.assign(ativo=ids.values).drop_duplicates("ativo")
-    return out[out.valor.abs() >= 1], info
+    # quem é dono de quem: parte do PL de cada fundo que está com OUTROS fundos (soma da coluna de W)
+    de_fundos = np.clip(np.asarray(W.sum(axis=0)).ravel(), 0, 1)
+    em_cotas = c.groupby("CNPJ_FUNDO_CLASSE").valor.sum().reindex(fundos).fillna(0) / pl.reindex(fundos)
+    F = pd.DataFrame({"fundo": fundos, "pl": pl.reindex(fundos).values, "de_outros_fundos": de_fundos,
+                      "externo": 1 - de_fundos, "em_cotas_que_abrem": em_cotas.values})
+    F["papel"] = np.select([F.de_outros_fundos >= .95, F.em_cotas_que_abrem >= .5], ["só de fundos (master/alimentado)", "FIC"],
+                           "direto")
+    # total do mercado sem dupla contagem = soma das posições diretas que não abrem (= soma de valor x externo)
+    tot = pd.DataFrame({"ativo": ativos, "valor_total": np.asarray(D.sum(axis=0)).ravel()})
+    return out[out.valor.abs() >= 1], info, F, tot[tot.valor_total.abs() >= 1]
 
 
 def main():
@@ -104,8 +120,9 @@ def main():
         oculto = pos.valor[pos.bloco.str.endswith("CONFID")].sum() / pos.valor.sum()
         if not feitos and oculto > LIMITE_OCULTO:
             print(f"{ym}: {oculto:.0%} oculto - pula"); continue
-        out, info = explode(pl, pos)
+        out, info, F, tot = explode(pl, pos)
         out.to_parquet(SAIDA / f"{ym}.parquet", index=False); infos.append(info); feitos.append(ym)
+        F.to_parquet(SAIDA / f"fundos_{ym}.parquet", index=False); tot.to_parquet(SAIDA / f"total_{ym}.parquet", index=False)
         print(f"{ym}: {oculto:.1%} oculto | {pl.size:,} fundos | {len(out):,} linhas explodidas", flush=True)
     pd.concat(infos).drop_duplicates("ativo").to_parquet(SAIDA / "ativos.parquet", index=False)
     print(f"pronto: {feitos[-1]} a {feitos[0]} em {SAIDA}")
